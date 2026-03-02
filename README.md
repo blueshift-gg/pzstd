@@ -20,7 +20,7 @@ Benchmarked on 16-thread hardware with 4MB frame chunks:
 ```rust
 // Decompress a multi-frame zstd file
 let compressed = std::fs::read("snapshot.tar.zst").unwrap();
-let data = pzstd::decompress(&compressed).unwrap();
+let data = pzstd::decompressor::decompress(&compressed).unwrap();
 
 // With custom per-frame capacity limit
 let data = pzstd::decompress_with_capacity(&compressed, 256 * 1024 * 1024).unwrap();
