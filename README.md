@@ -23,30 +23,56 @@ let compressed = std::fs::read("snapshot.tar.zst").unwrap();
 let data = pzstd::decompressor::decompress(&compressed).unwrap();
 
 // With custom per-frame capacity limit
-let data = pzstd::decompress_with_max_frame_size(&compressed, 256 * 1024 * 1024).unwrap();
+let data = pzstd::decompressor::decompress_with_max_frame_size(&compressed, 256 * 1024 * 1024).unwrap();
 ```
 
 ## Architecture
-
 ```text
-                                    ┌─────────────────────┐
-                                    │  All frames have     │
-                              Yes   │  Frame_Content_Size? │   No
-                           ┌────────┴─────────────────────┬┘────────┐
-                           │                              │         │
-                           ▼                              │         ▼
-Input ──→ Frame Scanner ──→ Fast Path                     │    Fallback Path
-          (find frame       • Single allocation           │    • Per-frame alloc
-           boundaries)      • split_at_mut slices         │    • Thread-local DCTX
-                            • Thread-local DCTX           │    • Parallel via rayon
-                            • decompress_to_buffer        │
-                            • Zero intermediate copies    │
-                           │                              │         │
-                           ▼                              │         ▼
-                           └────────────────────────┬─────┘─────────┘
-                                                    │
-                                                    ▼
-                                                 Output
+Input ──> Frame Scanner ──> Extract Frame_Content_Size
+                                      │
+                            ┌─────────┴─────────┐
+                            │                   │
+                        All known           Some missing
+                            │                   │
+                            │                   │
+                      ┌─────┴─────┐      ┌──────┴─────┐
+                      │ Fast Path │      │  Fallback  │
+                      ├───────────┤      ├────────────┤
+                      │ Single    │      │ Per-frame  │
+                      │ alloc     │      │ alloc      │
+                      │           │      │            │
+                      │ split_at  │      │ Thread-    │
+                      │ _mut      │      │ local DCTX │
+                      │ slices    │      │            │
+                      │           │      │ Parallel   │
+                      │ Thread-   │      │ via rayon  │
+                      │ local     │      │            │
+                      │ DCTX      │      └──────┬─────┘
+                      │           │             │
+                      │ Zero-copy │             │
+                      │ to buffer │             │
+                      └─────┬─────┘             │
+                            │                   │
+                            │                   │
+                      ┌─────┴───────────────────┴─────┐
+                      │   Parallel Decompression      │
+                      │   (rayon thread pool)         │
+                      ├───────────────────────────────┤
+                      │                               │
+                      │  Thread 0: DCTX.decompress    │
+                      │    frame[0] ──> output[0..N]  │
+                      │                               │
+                      │  Thread 1: DCTX.decompress    │
+                      │    frame[1] ──> output[N..M]  │
+                      │                               │
+                      │  Thread 2: DCTX.decompress    │
+                      │    frame[2] ──> output[M..P]  │
+                      │                               │
+                      │  ...                          │
+                      └───────────────┬───────────────┘
+                                      │
+                                      │
+                                   Output
 ```
 
 ### Key Optimizations
