@@ -130,8 +130,8 @@ fn truncated_frame_returns_error() {
 fn capacity_exceeded_returns_error() {
     let original = generate_test_data(100_000);
     let compressed = compress_frame(&original, 3);
-    // set capacity smaller than pzstd::decompressor::decompressed size
-    let result = pzstd::decompressor::decompress_with_capacity(&compressed, 1024);
+    // set max_frame_size smaller than pzstd::decompressor::decompressed size
+    let result = pzstd::decompressor::decompress_with_max_frame_size(&compressed, 1024);
     assert!(matches!(result, Err(PzstdError::DecompressFailed { .. })));
 }
 

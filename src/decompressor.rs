@@ -32,7 +32,7 @@ thread_local! {
 ///
 /// # Arguments
 /// * `input` - Raw bytes of the compressed zstd/pzstd data.
-/// * `capacity` - Maximum decompressed size per frame in bytes.
+/// * `max_frame_size` - Maximum decompressed size per frame in bytes.
 ///   Only used in the fallback path when `Frame_Content_Size` is not
 ///   available. Acts as a safety limit to prevent memory exhaustion
 ///   from malicious or corrupted frames.
@@ -42,8 +42,8 @@ thread_local! {
 /// - [`PzstdError::InvalidMagic`] if an unrecognized frame magic is encountered.
 /// - [`PzstdError::NoFrames`] if no valid data frames are found.
 /// - [`PzstdError::DecompressFailed`] if any frame fails to decompress,
-///   including when decompressed size exceeds `capacity`.
-pub fn decompress_with_capacity(input: &[u8], capacity: usize) -> Result<Vec<u8>> {
+///   including when decompressed size exceeds `max_frame_size`.
+pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Result<Vec<u8>> {
     let frames = Frame::scan_frames(input, FrameScanMode::DataOnly)?;
 
     // Check if all frames have known decompressed sizes
@@ -54,7 +54,7 @@ pub fn decompress_with_capacity(input: &[u8], capacity: usize) -> Result<Vec<u8>
 
     match sizes {
         Some(sizes) => decompress_fast_path(input, &frames, &sizes),
-        None => decompress_fallback(input, &frames, capacity),
+        None => decompress_fallback(input, &frames, max_frame_size),
     }
 }
 
@@ -101,19 +101,19 @@ fn decompress_fast_path(input: &[u8], frames: &[Frame], sizes: &[usize]) -> Resu
 }
 
 /// Fallback path: frame sizes unknown, allocate per frame.
-fn decompress_fallback(input: &[u8], frames: &[Frame], capacity: usize) -> Result<Vec<u8>> {
+fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) -> Result<Vec<u8>> {
     let results: Vec<Vec<u8>> = frames
         .par_iter()
         .enumerate()
         .map(|(idx, frame)| {
             let bytes = frame.bytes(input)?;
             DCTX.with(|dctx| {
-                dctx.borrow_mut().decompress(bytes, capacity).map_err(|e| {
-                    PzstdError::DecompressFailed {
+                dctx.borrow_mut()
+                    .decompress(bytes, max_frame_size)
+                    .map_err(|e| PzstdError::DecompressFailed {
                         frame_index: idx,
                         source: e,
-                    }
-                })
+                    })
             })
         })
         .collect::<Result<Vec<Vec<u8>>>>()?;
@@ -129,12 +129,12 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], capacity: usize) -> Resul
 
 /// Decompress a zstd or pzstd compressed input in parallel.
 ///
-/// Convenience wrapper around [`decompress_with_capacity`] using a
+/// Convenience wrapper around [`decompress_with_max_frame_size`] using a
 /// default per-frame limit of 512 MB. Suitable for most use cases
 /// including Solana snapshot decompression.
 ///
 /// For inputs with exceptionally large frames, or to set a stricter
-/// memory limit, use [`decompress_with_capacity`] directly.
+/// memory limit, use [`decompress_with_max_frame_size`] directly.
 ///
 /// # Example
 /// ```no_run
@@ -143,7 +143,7 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], capacity: usize) -> Resul
 /// ```
 ///
 /// # Errors
-/// See [`decompress_with_capacity`] for the full list of error conditions.
+/// See [`decompress_with_max_frame_size`] for the full list of error conditions.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
-    decompress_with_capacity(input, DEFAULT_FRAME_CAPACITY)
+    decompress_with_max_frame_size(input, DEFAULT_FRAME_CAPACITY)
 }
