@@ -68,7 +68,7 @@ fn bench_decompress(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("pzstd-parallel-multi", label),
+            BenchmarkId::new("pzstd-parallel-multi-frame", label),
             &multi,
             |b, compressed| b.iter(|| pzstd::decompressor::decompress(compressed).unwrap()),
         );
