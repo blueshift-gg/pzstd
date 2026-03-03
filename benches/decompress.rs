@@ -55,7 +55,7 @@ fn bench_decompress(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("zstd-sequential-multi", label),
+            BenchmarkId::new("zstd-sequential-multi-frame", label),
             &multi,
             |b, compressed| {
                 b.iter(|| {
