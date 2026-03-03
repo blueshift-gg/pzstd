@@ -11,7 +11,7 @@ pub const ZSTD_MAGIC_SKIP_MIN: u32 = 0x184D2A50;
 pub const ZSTD_MAGIC_SKIP_MAX: u32 = 0x184D2A5F;
 
 /// Size of the magic number field in bytes.
-pub const MAGIC_SIZE: usize = 4;
+pub const SKIPPABLE_FRAME_HEADER_SIZE: usize = 4;
 
 /// Size of a skippable frame header field 4 bytes frame data size.
 pub const SKIPPABLE_FIELD_SIZE: usize = 4;

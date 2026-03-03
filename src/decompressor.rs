@@ -10,10 +10,38 @@ use crate::{
 };
 
 thread_local! {
-    /// Per-thread reusable decompression context.
+    /// Per-thread reusable decompression context (lazily initialized).
     /// Avoids creating/destroying a context for every frame.
-    static DCTX: RefCell<zstd::bulk::Decompressor<'static>> =
-        RefCell::new(zstd::bulk::Decompressor::new().unwrap());
+    static DCTX: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
+}
+
+/// Lazily initialize the thread-local decompressor and invoke `f` with it.
+fn with_decompressor<T>(
+    frame_index: usize,
+    f: impl FnOnce(&mut zstd::bulk::Decompressor<'static>) -> std::io::Result<T>,
+) -> Result<T> {
+    DCTX.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(zstd::bulk::Decompressor::new().map_err(|e| {
+                PzstdError::DecompressFailed {
+                    frame_index,
+                    source: e,
+                }
+            })?);
+        }
+        let dctx = guard.as_mut().ok_or_else(|| PzstdError::DecompressFailed {
+            frame_index,
+            source: std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "decompressor context unavailable",
+            ),
+        })?;
+        f(dctx).map_err(|e| PzstdError::DecompressFailed {
+            frame_index,
+            source: e,
+        })
+    })
 }
 
 /// Decompress a zstd or pzstd compressed input in parallel.
@@ -45,18 +73,19 @@ thread_local! {
 pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Result<Vec<u8>> {
     let frames = Frame::scan_frames(input, FrameScanMode::DataOnly)?;
 
-    // Single pass: check all frames have known sizes within limit and compute total
-    let mut total_decompressed: usize = 0;
+    // Single pass: check all frames have known sizes within limit and collect them
+    let mut sizes: Vec<usize> = Vec::with_capacity(frames.len());
     let all_sizes_known = frames.iter().all(|f| match f.decompressed_size {
         Some(s) if (s as usize) <= max_frame_size => {
-            total_decompressed += s as usize;
+            sizes.push(s as usize);
             true
         }
         _ => false,
     });
 
     if all_sizes_known {
-        decompress_fast_path(input, &frames, total_decompressed)
+        let total: usize = sizes.iter().copied().sum();
+        decompress_fast_path(input, &frames, &sizes, total)
     } else {
         decompress_fallback(input, &frames, max_frame_size)
     }
@@ -65,7 +94,7 @@ pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Re
 /// Fast path: all frames have known decompressed sizes.
 /// Pre-allocates a single output buffer and decompresses directly
 /// into non-overlapping regions — zero intermediate allocations.
-fn decompress_fast_path(input: &[u8], frames: &[Frame], total_size: usize) -> Result<Vec<u8>> {
+fn decompress_fast_path(input: &[u8], frames: &[Frame], sizes: &[usize], total_size: usize) -> Result<Vec<u8>> {
     let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(total_size);
     // SAFETY: MaybeUninit<u8> doesn't require initialization; decompress_to_buffer
     // writes exactly `size` bytes per frame on success, covering every byte.
@@ -78,14 +107,7 @@ fn decompress_fast_path(input: &[u8], frames: &[Frame], total_size: usize) -> Re
     // skip rayon overhead for a single frame
     if frames.len() == 1 {
         let src = frames[0].bytes(input)?;
-        DCTX.with(|dctx| {
-            dctx.borrow_mut()
-                .decompress_to_buffer(src, output)
-                .map_err(|e| PzstdError::DecompressFailed {
-                    frame_index: 0,
-                    source: e,
-                })
-        })?;
+        with_decompressor(0, |dctx| dctx.decompress_to_buffer(src, output))?;
         // SAFETY: all bytes written by decompress_to_buffer.
         return Ok(unsafe { transmute_uninit_vec(buf) });
     }
@@ -96,11 +118,8 @@ fn decompress_fast_path(input: &[u8], frames: &[Frame], total_size: usize) -> Re
         .par_iter()
         .enumerate()
         .try_for_each(|(idx, frame)| {
-            let dst_offset: usize = frames[..idx]
-                .iter()
-                .map(|f| f.decompressed_size.unwrap() as usize)
-                .sum();
-            let size = frame.decompressed_size.unwrap() as usize;
+            let dst_offset: usize = sizes[..idx].iter().copied().sum();
+            let size = sizes[idx];
 
             // SAFETY: each thread writes to a disjoint [offset..offset+size] region.
             // The ranges are non-overlapping because they are derived from a prefix
@@ -110,14 +129,7 @@ fn decompress_fast_path(input: &[u8], frames: &[Frame], total_size: usize) -> Re
             };
 
             let src = frame.bytes(input)?;
-            DCTX.with(|dctx| {
-                dctx.borrow_mut()
-                    .decompress_to_buffer(src, dst)
-                    .map_err(|e| PzstdError::DecompressFailed {
-                        frame_index: idx,
-                        source: e,
-                    })
-            })?;
+            with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))?;
 
             Ok(())
         })?;
@@ -148,14 +160,7 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
         let output = unsafe { &mut *(buf.as_mut_slice() as *mut [MaybeUninit<u8>] as *mut [u8]) };
 
         let src = frames[0].bytes(input)?;
-        let written = DCTX.with(|dctx| {
-            dctx.borrow_mut()
-                .decompress_to_buffer(src, output)
-                .map_err(|e| PzstdError::DecompressFailed {
-                    frame_index: 0,
-                    source: e,
-                })
-        })?;
+        let written = with_decompressor(0, |dctx| dctx.decompress_to_buffer(src, output))?;
 
         unsafe { buf.set_len(written) };
         return Ok(unsafe { transmute_uninit_vec(buf) });
@@ -194,14 +199,7 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
             };
 
             let src = frame.bytes(input)?;
-            DCTX.with(|dctx| {
-                dctx.borrow_mut()
-                    .decompress_to_buffer(src, dst)
-                    .map_err(|e| PzstdError::DecompressFailed {
-                        frame_index: idx,
-                        source: e,
-                    })
-            })
+            with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))
         })
         .collect::<Result<Vec<usize>>>()?;
 

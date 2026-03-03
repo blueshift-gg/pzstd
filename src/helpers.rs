@@ -14,9 +14,11 @@ pub fn read_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]
             needed: N,
             available: bytes.len().saturating_sub(offset),
         })?;
-    // SAFETY: `b` is exactly `N` bytes from the `.get()` above.
-    // `try_into()` is infallible here; the compiler elides the panic path.
-    Ok(b.try_into().unwrap())
+    b.try_into().map_err(|_| PzstdError::UnexpectedEof {
+        offset,
+        needed: N,
+        available: bytes.len().saturating_sub(offset),
+    })
 }
 
 /// Read a 3-byte little-endian block header at the given offset.

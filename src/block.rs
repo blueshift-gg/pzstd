@@ -16,18 +16,21 @@ pub enum BlockType {
 }
 
 impl TryFrom<u8> for BlockType {
-    type Error = u8;
+    type Error = PzstdError;
 
     /// Convert a 2-bit block type value to a [`BlockType`].
     ///
-    /// Returns `Err(value)` for unknown types (including 3, which is
-    /// reserved by the spec and must not appear in valid frames).
-    fn try_from(value: u8) -> core::result::Result<Self, Self::Error> {
+    /// Returns `Err(PzstdError::InvalidBlockType)` for unknown types
+    /// (including 3, which is reserved by the spec and must not appear in valid frames).
+    fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Self::Raw),
             1 => Ok(Self::Rle),
             2 => Ok(Self::Compressed),
-            _ => Err(value),
+            _ => Err(PzstdError::InvalidBlockType {
+                offset: 0,
+                block_type: value,
+            }),
         }
     }
 }
@@ -51,11 +54,12 @@ impl BlockHeader {
         let btype = ((raw >> 1) & 0x3) as u8;
         let size = (raw >> 3) & 0x1FFFFF;
 
-        let block_type =
-            BlockType::try_from(btype).map_err(|bt| PzstdError::InvalidBlockType {
-                offset,
-                block_type: bt,
-            })?;
+        let block_type = BlockType::try_from(btype).map_err(|e| match e {
+            PzstdError::InvalidBlockType { block_type, .. } => {
+                PzstdError::InvalidBlockType { offset, block_type }
+            }
+            other => other,
+        })?;
 
         Ok(Self {
             last,
