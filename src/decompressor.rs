@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 use crate::{
     error::{PzstdError, Result},
@@ -84,8 +86,8 @@ pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Re
     });
 
     if all_sizes_known {
-        let total: usize = sizes.iter().copied().sum();
-        decompress_fast_path(input, &frames, &sizes, total)
+        let total_decompressed: usize = sizes.iter().copied().sum();
+        decompress_fast_path(input, &frames, &sizes, total_decompressed)
     } else {
         decompress_fallback(input, &frames, max_frame_size)
     }
@@ -94,11 +96,11 @@ pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Re
 /// Fast path: all frames have known decompressed sizes.
 /// Pre-allocates a single output buffer and decompresses directly
 /// into non-overlapping regions — zero intermediate allocations.
-fn decompress_fast_path(input: &[u8], frames: &[Frame], sizes: &[usize], total_size: usize) -> Result<Vec<u8>> {
-    let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(total_size);
+fn decompress_fast_path(input: &[u8], frames: &[Frame], sizes: &[usize], total_decompressed: usize) -> Result<Vec<u8>> {
+    let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(total_decompressed);
     // SAFETY: MaybeUninit<u8> doesn't require initialization; decompress_to_buffer
     // writes exactly `size` bytes per frame on success, covering every byte.
-    unsafe { buf.set_len(total_size) };
+    unsafe { buf.set_len(total_decompressed) };
 
     // Reinterpret as &mut [u8] for the decompressor API.
     // SAFETY: MaybeUninit<u8> has the same layout as u8.
@@ -112,25 +114,22 @@ fn decompress_fast_path(input: &[u8], frames: &[Frame], sizes: &[usize], total_s
         return Ok(unsafe { transmute_uninit_vec(buf) });
     }
 
-    let base_addr = output.as_mut_ptr() as usize;
+    // Split output into disjoint per-frame destination slices
+    let mut dst_slices: Vec<&mut [u8]> = Vec::with_capacity(frames.len());
+    let mut rest = &mut *output;
+    for &size in sizes {
+        let (chunk, remainder) = rest.split_at_mut(size);
+        dst_slices.push(chunk);
+        rest = remainder;
+    }
 
     frames
         .par_iter()
+        .zip(dst_slices.into_par_iter())
         .enumerate()
-        .try_for_each(|(idx, frame)| {
-            let dst_offset: usize = sizes[..idx].iter().copied().sum();
-            let size = sizes[idx];
-
-            // SAFETY: each thread writes to a disjoint [offset..offset+size] region.
-            // The ranges are non-overlapping because they are derived from a prefix
-            // sum of known frame sizes that sum to total_size.
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut((base_addr + dst_offset) as *mut u8, size)
-            };
-
+        .try_for_each(|(idx, (frame, dst))| {
             let src = frame.bytes(input)?;
             with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))?;
-
             Ok(())
         })?;
 
