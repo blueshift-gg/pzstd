@@ -62,16 +62,18 @@ pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Re
 
     // Single pass: check all frames have known sizes within limit and collect them
     let mut sizes: Vec<usize> = Vec::with_capacity(frames.len());
+    let mut total_decompressed: usize = 0;
     let all_sizes_known = frames.iter().all(|f| match f.decompressed_size {
         Some(s) if (s as usize) <= max_frame_size => {
-            sizes.push(s as usize);
+            let size = s as usize;
+            sizes.push(size);
+            total_decompressed += size;
             true
         }
         _ => false,
     });
 
     if all_sizes_known {
-        let total_decompressed: usize = sizes.iter().copied().sum();
         decompress_fast_path(input, &frames, &sizes, total_decompressed)
     } else {
         decompress_fallback(input, &frames, max_frame_size)
@@ -118,6 +120,7 @@ fn decompress_fast_path(
         dst_slices.push(chunk);
     }
 
+    // Decompress each frame in parallel into its pre-allocated output slice.
     frames
         .par_iter()
         .zip(dst_slices.into_par_iter())
