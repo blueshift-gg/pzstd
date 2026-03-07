@@ -108,11 +108,14 @@ fn decompress_fast_path(
     // size + WILDCOPY_OVERLENGTH from the trailing padding.
     let mut dst_slices: Vec<&mut [u8]> = Vec::with_capacity(frames.len());
     let mut rest = output.as_mut_slice();
-    for (i, &size) in sizes.iter().enumerate() {
-        let slice_len = if i + 1 < sizes.len() { size } else { size + WILDCOPY_OVERLENGTH };
-        let (chunk, remainder) = rest.split_at_mut(slice_len);
+      if let Some((last, rest_sizes)) = sizes.split_last() {
+        for &size in rest_sizes {
+            let (chunk, remainder) = rest.split_at_mut(size);
+            dst_slices.push(chunk);
+            rest = remainder;
+        }
+        let (chunk, _) = rest.split_at_mut(last + WILDCOPY_OVERLENGTH);
         dst_slices.push(chunk);
-        rest = remainder;
     }
 
     frames
