@@ -2,7 +2,8 @@ use crate::{
     block::{BlockHeader, BlockType},
     consts::{
         BLOCK_HEADER_SIZE, BLOCK_MAX_DECOMPRESSED_SIZE, CHECKSUM_SIZE, DID_FIELD_SIZES,
-        FCS_FIELD_SIZES, SKIPPABLE_FRAME_HEADER_SIZE, ZSTD_MAGIC_NUMBER, is_skippable_magic,
+        FCS_FIELD_SIZES, MAGIC_NUMBER_SIZE, SKIPPABLE_FIELD_SIZE, ZSTD_MAGIC_NUMBER,
+        is_skippable_magic,
     },
     error::{PzstdError, Result},
     helpers::{read_block_header, read_u8, read_u16, read_u32, read_u64},
@@ -64,7 +65,7 @@ impl Frame {
             let frame_start = pos;
 
             let magic = read_u32(input, pos)?;
-            pos += SKIPPABLE_FRAME_HEADER_SIZE;
+            pos += MAGIC_NUMBER_SIZE;
             let kind = FrameKind::from_magic_with_offset(magic, frame_start)?;
 
             let mut decompressed_size = None;
@@ -73,7 +74,7 @@ impl Frame {
             match kind {
                 FrameKind::Skippable => {
                     let frame_size = read_u32(input, pos)? as usize;
-                    pos += SKIPPABLE_FRAME_HEADER_SIZE + frame_size;
+                    pos += SKIPPABLE_FIELD_SIZE + frame_size;
                 }
                 FrameKind::Data => {
                     let desc_byte = read_u8(input, pos)?;
