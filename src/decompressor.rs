@@ -1,14 +1,71 @@
 use std::cell::RefCell;
-
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{
+    Arc, Condvar, LazyLock, Mutex, OnceLock,
+    atomic::{AtomicUsize, Ordering},
 };
+use std::thread;
 
 use crate::{
     consts::{DEFAULT_FRAME_CAPACITY, WILDCOPY_OVERLENGTH},
     error::{PzstdError, Result},
     frame::{Frame, FrameScanMode},
 };
+
+type Task = Box<dyn FnOnce() + Send>;
+
+struct WorkerSlot {
+    task: Mutex<Option<Task>>,
+    notify: Condvar,
+}
+
+struct ThreadPool {
+    slots: Arc<[WorkerSlot]>,
+    size: usize,
+}
+
+impl ThreadPool {
+    fn new(size: usize) -> Self {
+        let slots: Arc<[WorkerSlot]> = (0..size)
+            .map(|_| WorkerSlot {
+                task: Mutex::new(None),
+                notify: Condvar::new(),
+            })
+            .collect();
+
+        for id in 0..size {
+            let slots = Arc::clone(&slots);
+            thread::Builder::new()
+                .name("pzstd-worker".into())
+                .spawn(move || {
+                    let slot = &slots[id];
+                    loop {
+                        let task = {
+                            let mut guard = slot.task.lock().unwrap();
+                            loop {
+                                if let Some(task) = guard.take() {
+                                    break task;
+                                }
+                                guard = slot.notify.wait(guard).unwrap();
+                            }
+                        };
+                        // catch_unwind keeps the worker alive if a task panics.
+                        let _ = panic::catch_unwind(AssertUnwindSafe(task));
+                    }
+                })
+                .expect("failed to spawn pzstd worker thread");
+        }
+
+        Self { slots, size }
+    }
+}
+
+static POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+    let n = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    ThreadPool::new(n)
+});
 
 thread_local! {
     /// Per-thread reusable decompression context.
@@ -31,12 +88,93 @@ fn with_decompressor<T>(
     })
 }
 
+/// Allocate `len` bytes without zeroing. Every byte must be written before read.
+///
+/// # Safety
+/// Caller must ensure all bytes in `0..len` are written before being read.
+/// Safe to drop without writing (no drop glue for `u8`).
+#[inline]
+unsafe fn alloc_uninit(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        v.set_len(len)
+    };
+    v
+}
+
+/// Run `f(frame_index, frame)` in parallel across the global thread pool.
+/// Frames are partitioned into contiguous chunks, one per worker.
+/// Blocks until all chunks complete. Returns the first error encountered.
+fn parallel_for_each(
+    frames: &[Frame],
+    f: impl Fn(usize, &Frame) -> Result<()> + Sync,
+) -> Result<()> {
+    let n_threads = POOL.size.min(frames.len());
+    let chunk_size = frames.len().div_ceil(n_threads);
+    let error: OnceLock<PzstdError> = OnceLock::new();
+
+    // Completion barrier: each task decrements; last one signals the caller.
+    let remaining = AtomicUsize::new(0);
+    let done_lock = Mutex::new(false);
+    let done_cvar = Condvar::new();
+
+    let chunks: Vec<_> = frames.chunks(chunk_size).collect();
+    remaining.store(chunks.len(), Ordering::Release);
+
+    for (worker_id, chunk) in chunks.into_iter().enumerate() {
+        let base_idx = worker_id * chunk_size;
+        let error = &error;
+        let f = &f;
+        let remaining = &remaining;
+        let done_lock = &done_lock;
+        let done_cvar = &done_cvar;
+
+        // SAFETY: We block below (done_cvar.wait) until every task has
+        // completed, so all borrowed data outlives the closures. This is
+        // the same lifetime-erasure technique used by std::thread::scope.
+        let task: Task = unsafe {
+            std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Task>(Box::new(move || {
+                for (i, frame) in chunk.iter().enumerate() {
+                    if error.get().is_some() {
+                        break;
+                    }
+                    let idx = base_idx + i;
+                    if let Err(e) = f(idx, frame) {
+                        let _ = error.set(e);
+                    }
+                }
+                // Signal completion — last task wakes the caller.
+                if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    *done_lock.lock().unwrap() = true;
+                    done_cvar.notify_one();
+                }
+            }))
+        };
+
+        let slot = &POOL.slots[worker_id];
+        *slot.task.lock().unwrap() = Some(task);
+        slot.notify.notify_one();
+    }
+
+    // Block until all tasks finish — guarantees soundness of lifetime erasure.
+    let mut done = done_lock.lock().unwrap();
+    while !*done {
+        done = done_cvar.wait(done).unwrap();
+    }
+
+    match error.into_inner() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Decompress a zstd or pzstd compressed input in parallel.
 ///
 /// Scans the input for independent zstd frame boundaries, then
-/// decompresses each data frame concurrently using rayon's thread pool.
-/// Each rayon thread reuses a decompression context to avoid per-frame
-/// setup overhead. Frames are reassembled in original order.
+/// decompresses each data frame concurrently using a persistent thread
+/// pool. Each worker reuses a thread-local decompression context to
+/// avoid per-frame setup overhead. Frames are reassembled in original order.
 ///
 /// When `Frame_Content_Size` is available in all frames, uses a fast path
 /// that pre-allocates a single output buffer and decompresses directly
@@ -89,14 +227,15 @@ fn decompress_fast_path(
     sizes: &[usize],
     total_decompressed: usize,
 ) -> Result<Vec<u8>> {
-    // Overallocate by WILDCOPY_OVERLENGTH so zstd's internal wildcopy loop
-    // can use fast SIMD copies for the last frame without bounds-checking.
-    // Interior frames already have implicit headroom from the next frame's data.
-    // Zeroed allocation pre-faults pages sequentially, warming the TLB and
-    // cache hierarchy before parallel decompression touches them.
-    let mut output = vec![0u8; total_decompressed + WILDCOPY_OVERLENGTH];
+    let alloc_len = total_decompressed + WILDCOPY_OVERLENGTH;
 
-    // skip rayon overhead for a single frame
+    // SAFETY: every byte in 0..total_decompressed is written by decompression,
+    // and the WILDCOPY_OVERLENGTH tail is only touched by zstd's internal
+    // wildcopy (overwrite-only, never read by our code). Skipping the zero-fill
+    // avoids a full memset pass over the output (~25ms saved at 500MB).
+    let mut output = unsafe { alloc_uninit(alloc_len) };
+
+    // Skip thread pool overhead for a single frame.
     if frames.len() == 1 {
         let src = frames[0].bytes(input)?;
         with_decompressor(0, |dctx| dctx.decompress_to_buffer(src, &mut output))?;
@@ -104,32 +243,37 @@ fn decompress_fast_path(
         return Ok(output);
     }
 
-    // Split output into disjoint per-frame destination slices.
-    // Each interior frame gets exactly its decompressed size (the adjacent
-    // next frame provides implicit wildcopy headroom). The last frame gets
-    // size + WILDCOPY_OVERLENGTH from the trailing padding.
-    let mut dst_slices: Vec<&mut [u8]> = Vec::with_capacity(frames.len());
-    let mut rest = output.as_mut_slice();
-      if let Some((last, rest_sizes)) = sizes.split_last() {
-        for &size in rest_sizes {
-            let (chunk, remainder) = rest.split_at_mut(size);
-            dst_slices.push(chunk);
-            rest = remainder;
-        }
-        let (chunk, _) = rest.split_at_mut(last + WILDCOPY_OVERLENGTH);
-        dst_slices.push(chunk);
+    // Compute per-frame offsets into the output buffer.
+    let mut offsets = Vec::with_capacity(frames.len());
+    let mut offset = 0usize;
+    for &size in sizes {
+        offsets.push(offset);
+        offset += size;
     }
 
-    // Decompress each frame in parallel into its pre-allocated output slice.
-    frames
-        .par_iter()
-        .zip(dst_slices.into_par_iter())
-        .enumerate()
-        .try_for_each(|(idx, (frame, dst))| {
-            let src = frame.bytes(input)?;
-            with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))?;
-            Ok(())
-        })?;
+    let base_addr = output.as_mut_ptr() as usize;
+    let total_len = output.len();
+
+    parallel_for_each(frames, |idx, frame| {
+        let region_offset = offsets[idx];
+        // Interior frames: exactly their size (next frame provides wildcopy headroom).
+        // Last frame: size + WILDCOPY_OVERLENGTH from trailing padding.
+        let region_size = if idx + 1 < offsets.len() {
+            offsets[idx + 1] - region_offset
+        } else {
+            total_len - region_offset
+        };
+
+        // SAFETY: each thread writes to a disjoint region derived from
+        // non-overlapping size-based offsets.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut((base_addr + region_offset) as *mut u8, region_size)
+        };
+
+        let src = frame.bytes(input)?;
+        with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))?;
+        Ok(())
+    })?;
 
     output.truncate(total_decompressed);
     Ok(output)
@@ -139,10 +283,12 @@ fn decompress_fast_path(
 /// pre-allocate a single output buffer and decompress directly into it.
 /// Gaps between bounded and actual sizes are compacted in-place afterward.
 fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) -> Result<Vec<u8>> {
-    // skip rayon overhead for a single frame
+    // Skip thread pool overhead for a single frame.
     if frames.len() == 1 {
         let bound = frames[0].decompressed_bound.min(max_frame_size);
-        let mut output = vec![0u8; bound + WILDCOPY_OVERLENGTH];
+        // SAFETY: all bytes up to `written` are filled by decompression;
+        // truncated immediately after.
+        let mut output = unsafe { alloc_uninit(bound + WILDCOPY_OVERLENGTH) };
 
         let src = frames[0].bytes(input)?;
         let written = with_decompressor(0, |dctx| dctx.decompress_to_buffer(src, &mut output))?;
@@ -159,31 +305,36 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
         total_bound += frame.decompressed_bound.min(max_frame_size) + WILDCOPY_OVERLENGTH;
     }
 
-    // Zeroed allocation: pre-faults pages sequentially before parallel decompression.
-    let mut output = vec![0u8; total_bound];
+    // SAFETY: every decompressed region is fully written by zstd; gaps between
+    // bounded and actual sizes are compacted below before the Vec is returned.
+    let mut output = unsafe { alloc_uninit(total_bound) };
     let base_addr = output.as_mut_ptr() as usize;
 
-    let actual_sizes: Vec<usize> = frames
-        .par_iter()
-        .enumerate()
-        .map(|(idx, frame)| {
-            let region_offset = offsets[idx];
-            let region_size = if idx + 1 < offsets.len() {
-                offsets[idx + 1] - region_offset
-            } else {
-                total_bound - region_offset
-            };
+    // Per-frame actual decompressed sizes, written by each thread to its own index.
+    let mut actual_sizes: Vec<usize> = vec![0usize; frames.len()];
+    let sizes_addr = actual_sizes.as_mut_ptr() as usize;
 
-            // SAFETY: each thread writes to a disjoint region derived from
-            // non-overlapping bound-based offsets.
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut((base_addr + region_offset) as *mut u8, region_size)
-            };
+    parallel_for_each(frames, |idx, frame| {
+        let region_offset = offsets[idx];
+        let region_size = if idx + 1 < offsets.len() {
+            offsets[idx + 1] - region_offset
+        } else {
+            total_bound - region_offset
+        };
 
-            let src = frame.bytes(input)?;
-            with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))
-        })
-        .collect::<Result<Vec<usize>>>()?;
+        // SAFETY: each thread writes to a disjoint region derived from
+        // non-overlapping bound-based offsets.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut((base_addr + region_offset) as *mut u8, region_size)
+        };
+
+        let src = frame.bytes(input)?;
+        let written = with_decompressor(idx, |dctx| dctx.decompress_to_buffer(src, dst))?;
+
+        // SAFETY: each thread writes to its own index — no overlap.
+        unsafe { *(sizes_addr as *mut usize).add(idx) = written };
+        Ok(())
+    })?;
 
     // Compact: close gaps where actual < bound by shifting data left in-place.
     // This is always safe because write_pos <= read_pos (cumulative actuals ≤
