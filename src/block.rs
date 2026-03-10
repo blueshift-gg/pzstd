@@ -1,6 +1,6 @@
 use crate::error::{PzstdError, Result};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
     /// Raw block (type 0): uncompressed data stored as-is.
     /// Block_Size equals the number of data bytes that follow.
@@ -13,12 +13,29 @@ pub enum BlockType {
     /// Compressed block (type 2): data compressed using Huffman and FSE.
     /// Block_Size is the compressed size; decompressed size may be larger.
     Compressed,
-
-    /// Reserved (type 3): not defined by the spec. Encountering this is an error.
-    Reserved,
 }
 
-#[derive(Debug, Clone)]
+impl TryFrom<u8> for BlockType {
+    type Error = PzstdError;
+
+    /// Convert a 2-bit block type value to a [`BlockType`].
+    ///
+    /// Returns `Err(PzstdError::InvalidBlockType)` for unknown types
+    /// (including 3, which is reserved by the spec and must not appear in valid frames).
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::Rle),
+            2 => Ok(Self::Compressed),
+            _ => Err(PzstdError::InvalidBlockType {
+                offset: 0,
+                block_type: value,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     pub last: bool,
     pub block_type: BlockType,
@@ -34,21 +51,15 @@ impl BlockHeader {
     ///   bits 3-23: Block_Size
     pub fn parse(raw: u32, offset: usize) -> Result<Self> {
         let last = (raw & 1) != 0;
-        let btype = (raw >> 1) & 0x3;
+        let btype = ((raw >> 1) & 0x3) as u8;
         let size = (raw >> 3) & 0x1FFFFF;
 
-        let block_type = match btype {
-            0 => BlockType::Raw,
-            1 => BlockType::Rle,
-            2 => BlockType::Compressed,
-            3 => {
-                return Err(PzstdError::InvalidBlockType {
-                    offset,
-                    block_type: 3,
-                });
+        let block_type = BlockType::try_from(btype).map_err(|e| match e {
+            PzstdError::InvalidBlockType { block_type, .. } => {
+                PzstdError::InvalidBlockType { offset, block_type }
             }
-            _ => unreachable!(),
-        };
+            other => other,
+        })?;
 
         Ok(Self {
             last,

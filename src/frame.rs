@@ -1,14 +1,15 @@
 use crate::{
     block::{BlockHeader, BlockType},
-    error::{PzstdError, Result},
-    helpers::{
-        BLOCK_HEADER_SIZE, CHECKSUM_SIZE, MAGIC_SIZE, SKIPPABLE_FRAME_HEADER_SIZE,
-        ZSTD_MAGIC_NUMBER, is_skippable_magic, read_block_header, read_u8, read_u16, read_u32,
-        read_u64,
+    consts::{
+        BLOCK_HEADER_SIZE, BLOCK_MAX_DECOMPRESSED_SIZE, CHECKSUM_SIZE, DID_FIELD_SIZES,
+        FCS_FIELD_SIZES, MAGIC_NUMBER_SIZE, SKIPPABLE_FIELD_SIZE, ZSTD_MAGIC_NUMBER,
+        is_skippable_magic,
     },
+    error::{PzstdError, Result},
+    helpers::{read_block_header, read_u8, read_u16, read_u32, read_u64},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     Data,
     Skippable,
@@ -16,14 +17,14 @@ pub enum FrameKind {
 
 impl FrameKind {
     /// Determine frame kind from a magic number.
-    pub fn from_magic(magic: u32) -> Result<Self> {
+    pub fn from_magic_with_offset(magic: u32, offset: usize) -> Result<Self> {
         if magic == ZSTD_MAGIC_NUMBER {
             Ok(FrameKind::Data)
         } else if is_skippable_magic(magic) {
             Ok(FrameKind::Skippable)
         } else {
             Err(PzstdError::InvalidMagic {
-                offset: 0,
+                offset,
                 found: magic,
             })
         }
@@ -38,10 +39,15 @@ pub struct Frame {
     /// Decompressed size of this frame, if known from the frame header.
     /// Only present for Data frames that have Frame_Content_Size set.
     pub decompressed_size: Option<u64>,
+    /// Upper bound on decompressed size, computed from block headers.
+    /// Always available for Data frames (Raw/RLE give exact block sizes,
+    /// Compressed blocks are bounded by 128 KB per RFC 8878).
+    /// Zero for Skippable frames.
+    pub decompressed_bound: usize,
 }
 
 /// Controls which frame types are returned by the scanner.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameScanMode {
     /// Return all frames (data + skippable).
     All,
@@ -51,22 +57,24 @@ pub enum FrameScanMode {
 
 impl Frame {
     pub fn scan_frames(input: &[u8], mode: FrameScanMode) -> Result<Vec<Frame>> {
-        let mut frames = Vec::new();
+        // Heuristic: assume ~256KB average frame size for initial capacity
+        let mut frames = Vec::with_capacity((input.len() / (256 * 1024)).max(1));
         let mut pos = 0;
 
         while pos < input.len() {
             let frame_start = pos;
 
             let magic = read_u32(input, pos)?;
-            pos += MAGIC_SIZE;
-            let kind = FrameKind::from_magic(magic)?;
+            pos += MAGIC_NUMBER_SIZE;
+            let kind = FrameKind::from_magic_with_offset(magic, frame_start)?;
 
             let mut decompressed_size = None;
+            let mut decompressed_bound: usize = 0;
 
             match kind {
                 FrameKind::Skippable => {
                     let frame_size = read_u32(input, pos)? as usize;
-                    pos += SKIPPABLE_FRAME_HEADER_SIZE + frame_size;
+                    pos += SKIPPABLE_FIELD_SIZE + frame_size;
                 }
                 FrameKind::Data => {
                     let desc_byte = read_u8(input, pos)?;
@@ -86,10 +94,20 @@ impl Frame {
                         let block = BlockHeader::parse(raw, pos)?;
                         pos += BLOCK_HEADER_SIZE;
 
-                        pos += match block.block_type {
-                            BlockType::Rle => 1,
-                            _ => block.size as usize,
-                        };
+                        match block.block_type {
+                            BlockType::Rle => {
+                                decompressed_bound += block.size as usize;
+                                pos += 1;
+                            }
+                            BlockType::Compressed => {
+                                decompressed_bound += BLOCK_MAX_DECOMPRESSED_SIZE;
+                                pos += block.size as usize;
+                            }
+                            _ => {
+                                decompressed_bound += block.size as usize;
+                                pos += block.size as usize;
+                            }
+                        }
 
                         if block.last {
                             break;
@@ -113,6 +131,7 @@ impl Frame {
                     len: pos - frame_start,
                     kind,
                     decompressed_size,
+                    decompressed_bound,
                 });
             }
         }
@@ -150,7 +169,7 @@ impl Frame {
 }
 
 /// Parsed flags from the Frame_Header_Descriptor byte.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameDescriptor {
     /// Frame_Content_Size_Flag (bits 7-6). Determines FCS field size.
     pub fcs_flag: u8,
@@ -160,6 +179,12 @@ pub struct FrameDescriptor {
     pub has_checksum: bool,
     /// Dictionary_ID_Flag (bits 1-0). Determines DID field size.
     pub did_flag: u8,
+}
+
+impl From<u8> for FrameDescriptor {
+    fn from(byte: u8) -> Self {
+        Self::parse(byte)
+    }
 }
 
 impl FrameDescriptor {
@@ -172,7 +197,7 @@ impl FrameDescriptor {
     ///   bit 3:    unused
     ///   bit 2:    Content_Checksum_Flag
     ///   bits 1-0: DID_Flag
-    pub fn parse(byte: u8) -> Self {
+    pub const fn parse(byte: u8) -> Self {
         Self {
             fcs_flag: (byte >> 6) & 0x3,
             single_segment: (byte >> 5) & 1 == 1,
@@ -182,38 +207,19 @@ impl FrameDescriptor {
     }
 
     /// Size of the Dictionary_ID field in bytes.
-    pub fn did_field_size(&self) -> usize {
-        match self.did_flag {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 4,
-            _ => unreachable!(),
-        }
+    pub const fn did_field_size(&self) -> usize {
+        DID_FIELD_SIZES[self.did_flag as usize]
     }
 
     /// Size of the Frame_Content_Size field in bytes.
-    pub fn fcs_field_size(&self) -> usize {
-        match self.fcs_flag {
-            0 => {
-                if self.single_segment {
-                    1
-                } else {
-                    0
-                }
-            }
-            1 => 2,
-            2 => 4,
-            3 => 8,
-            _ => unreachable!(),
-        }
+    pub const fn fcs_field_size(&self) -> usize {
+        FCS_FIELD_SIZES[((self.fcs_flag as usize) << 1) | (self.single_segment as usize)]
     }
 
     /// Size of the full frame header including the descriptor byte.
     /// This is needed to skip past the header to reach the first block.
-    pub fn header_size(&self) -> usize {
-        let window_size = if self.single_segment { 0 } else { 1 };
-        1 + window_size + self.did_field_size() + self.fcs_field_size()
+    pub const fn header_size(&self) -> usize {
+        1 + (!self.single_segment as usize) + self.did_field_size() + self.fcs_field_size()
     }
 
     /// Parse the Frame_Content_Size value from the input.
