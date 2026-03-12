@@ -74,7 +74,22 @@ impl Frame {
             match kind {
                 FrameKind::Skippable => {
                     let frame_size = read_u32(input, pos)? as usize;
-                    pos += SKIPPABLE_FIELD_SIZE + frame_size;
+                    let payload_start = pos + SKIPPABLE_FIELD_SIZE;
+                    let frame_end = payload_start.checked_add(frame_size).ok_or(
+                        PzstdError::UnexpectedEof {
+                            offset: payload_start,
+                            needed: frame_size,
+                            available: input.len().saturating_sub(payload_start),
+                        },
+                    )?;
+                    if frame_end > input.len() {
+                        return Err(PzstdError::UnexpectedEof {
+                            offset: payload_start,
+                            needed: frame_size,
+                            available: input.len().saturating_sub(payload_start),
+                        });
+                    }
+                    pos = frame_end;
                 }
                 FrameKind::Data => {
                     let desc_byte = read_u8(input, pos)?;

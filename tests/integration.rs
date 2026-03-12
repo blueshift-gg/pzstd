@@ -127,6 +127,21 @@ fn truncated_frame_returns_error() {
 }
 
 #[test]
+fn truncated_trailing_skippable_frame_returns_error() {
+    let original = generate_test_data(128 * 1024);
+    let mut compressed = compress_frame(&original, 3);
+
+    // Append a skippable frame header with declared payload size 8,
+    // but provide only 3 payload bytes to show truncation.
+    compressed.extend_from_slice(&pzstd::consts::ZSTD_MAGIC_SKIP_MIN.to_le_bytes());
+    compressed.extend_from_slice(&(8u32).to_le_bytes());
+    compressed.extend_from_slice(&[1, 2, 3]);
+
+    let result = pzstd::decompressor::decompress(&compressed);
+    assert!(matches!(result, Err(PzstdError::UnexpectedEof { .. })));
+}
+
+#[test]
 fn capacity_exceeded_returns_error() {
     let original = generate_test_data(100_000);
     let compressed = compress_frame(&original, 3);
