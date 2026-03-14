@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 zstd = "0.13.3"
-rayon = "1.11.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]
