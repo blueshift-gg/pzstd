@@ -20,13 +20,14 @@ Benchmarked on 16-thread hardware with 4MB frame chunks:
 ```rust
 // Decompress a multi-frame zstd file
 let compressed = std::fs::read("snapshot.tar.zst").unwrap();
-let data = pzstd::decompressor::decompress(&compressed).unwrap();
+let data = pzstd::decompress(&compressed).unwrap();
 
 // With custom per-frame capacity limit
-let data = pzstd::decompressor::decompress_with_max_frame_size(&compressed, 256 * 1024 * 1024).unwrap();
+let data = pzstd::decompress_with_max_frame_size(&compressed, 256 * 1024 * 1024).unwrap();
 ```
 
 ## Architecture
+
 ```text
 Input ──> Frame Scanner ──> Extract Frame_Content_Size
                                       │
@@ -35,28 +36,28 @@ Input ──> Frame Scanner ──> Extract Frame_Content_Size
                         All known           Some missing
                             │                   │
                             │                   │
-                      ┌─────┴─────┐      ┌──────┴─────┐
-                      │ Fast Path │      │  Fallback  │
-                      ├───────────┤      ├────────────┤
-                      │ Single    │      │ Per-frame  │
-                      │ alloc     │      │ alloc      │
-                      │           │      │            │
-                      │ split_at  │      │ Thread-    │
-                      │ _mut      │      │ local DCTX │
-                      │ slices    │      │            │
-                      │           │      │ Parallel   │
-                      │ Thread-   │      │ via rayon  │
-                      │ local     │      │            │
-                      │ DCTX      │      └──────┬─────┘
-                      │           │             │
-                      │ Zero-copy │             │
-                      │ to buffer │             │
-                      └─────┬─────┘             │
+                      ┌─────┴─────┐      ┌──────┴──────┐
+                      │ Fast Path │      │  Fallback   │
+                      ├───────────┤      ├─────────────┤
+                      │ Single    │      │ Single      │
+                      │ alloc     │      │ alloc       │
+                      │ (exact)   │      │ (bounded)   │
+                      │           │      │             │
+                      │ Disjoint  │      │ Disjoint    │
+                      │ slices    │      │ slices      │
+                      │           │      │             │
+                      │ Thread-   │      │ Thread-     │
+                      │ local     │      │ local DCTX  │
+                      │ DCTX      │      │             │
+                      │           │      │ In-place    │
+                      │ Zero-copy │      │ compaction  │
+                      │ to buffer │      │             │
+                      └─────┬─────┘      └──────┬──────┘
                             │                   │
                             │                   │
                       ┌─────┴───────────────────┴─────┐
                       │   Parallel Decompression      │
-                      │   (rayon thread pool)         │
+                      │   (persistent thread pool)    │
                       ├───────────────────────────────┤
                       │                               │
                       │  Thread 0: DCTX.decompress    │
@@ -77,15 +78,23 @@ Input ──> Frame Scanner ──> Extract Frame_Content_Size
 
 ### Key Optimizations
 
-**Thread-local decompression contexts** — Each rayon thread reuses a
-persistent `zstd::bulk::Decompressor` instead of creating and destroying
-one per frame. With 125 frames across 16 threads, this reduces context
-allocations from 125 to 16.
+**Persistent thread pool** — A `LazyLock` thread pool sized to
+`available_parallelism()` is created once and reused across calls.
+Workers park on a per-slot condvar, so there is no per-call thread
+spawn overhead.
 
-**Pre-allocated output buffer** — When `Frame_Content_Size` is known
-(the fast path), a single output buffer is allocated upfront. Each frame
-decompresses directly into its slice of the final buffer via
-`split_at_mut`, eliminating all intermediate allocations and copies.
+**Thread-local decompression contexts** — Each worker thread reuses a
+persistent `zstd::bulk::Decompressor` via `thread_local!`, reducing
+context allocations from N-frames to N-threads.
+
+**Pre-allocated output buffer** — Both paths allocate a single output
+buffer upfront. The fast path (all `Frame_Content_Size` known) allocates
+exactly; the fallback path allocates an upper bound derived from block
+headers and compacts in-place afterward.
+
+**Uninit allocation** — Output buffers skip zero-initialization via
+`set_len` on a `Vec::with_capacity`, avoiding a full memset pass over
+the output (saves ~25ms at 500 MB).
 
 **Zero-copy frame slicing** — The frame scanner records byte offsets
 into the input buffer. During decompression, frames reference the
@@ -101,12 +110,14 @@ original input directly — no copying of compressed data.
 2. **Size extraction** — Parses `Frame_Content_Size` from each frame
    header when available, enabling the fast pre-allocation path.
 
-3. **Parallel decompression** — Dispatches frames to rayon's thread
-   pool. Each thread decompresses its assigned frames using a reusable
-   context, writing directly into the pre-allocated output buffer.
+3. **Parallel decompression** — Partitions frames into contiguous
+   chunks and dispatches them across a persistent thread pool. Each
+   worker decompresses its assigned frames using a thread-local
+   context, writing directly into disjoint regions of the output buffer.
 
-4. **Ordered reassembly** — rayon preserves iteration order, so the
-   output is correctly assembled without explicit sorting or reordering.
+4. **Ordered reassembly** — Frames are assigned to output regions by
+   their original index, so the output is correctly assembled without
+   explicit sorting or reordering.
 
 ## Compatibility
 
@@ -118,7 +129,6 @@ original input directly — no copying of compressed data.
 ## Dependencies
 
 - `zstd` — Per-frame decompression (wraps the C zstd library)
-- `rayon` — Work-stealing thread pool for parallel iteration
 - `thiserror` — Error type derivation
 
 ## License
